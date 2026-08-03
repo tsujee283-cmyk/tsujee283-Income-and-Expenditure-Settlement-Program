@@ -1,0 +1,502 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Vintage Forest - 古着物販 収支管理</title>
+    <!-- Tailwind CSS CDN -->
+    <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
+    <style>
+        @keyframes pulse-slow {
+            0%, 100% { opacity: 0.7; transform: scale(1); }
+            50% { opacity: 0.9; transform: scale(1.05); }
+        }
+        .bg-blob-1 { animation: pulse-slow 8s infinite ease-in-out; }
+        .bg-blob-2 { animation: pulse-slow 10s infinite ease-in-out; }
+        .fade-in {
+            animation: fadeIn 0.8s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+            opacity: 0;
+            transform: translateY(20px);
+        }
+        @keyframes fadeIn {
+            to { opacity: 1; transform: translateY(0); }
+        }
+    </style>
+</head>
+<body class="min-h-screen bg-[#F0EBE1] text-[#3D352B] font-sans selection:bg-[#7D9179] selection:text-white pb-20 relative overflow-x-hidden">
+
+    <!-- 背景の装飾 -->
+    <div class="fixed top-[-10%] left-[-10%] w-[50vw] h-[50vw] bg-[#E1D7C6] rounded-full mix-blend-multiply filter blur-[100px] opacity-70 z-0 bg-blob-1"></div>
+    <div class="fixed bottom-[-10%] right-[-10%] w-[60vw] h-[60vw] bg-[#D4E0D1] rounded-full mix-blend-multiply filter blur-[120px] opacity-60 z-0 bg-blob-2"></div>
+
+    <div id="app" class="relative z-10 max-w-5xl mx-auto px-4 sm:px-6 lg:px-8 pt-6 sm:pt-12">
+        <!-- 動的コンテンツがここに描画されます -->
+    </div>
+
+    <!-- Firebase SDKs -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { 
+            getAuth, signInWithCustomToken, signInAnonymously, onAuthStateChanged, 
+            createUserWithEmailAndPassword, signInWithEmailAndPassword, signOut 
+        } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { 
+            getFirestore, collection, onSnapshot, addDoc, updateDoc, deleteDoc, doc, setDoc 
+        } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // --- Firebase初期化 ---
+        const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {
+            apiKey: "", authDomain: "", projectId: "", storageBucket: "", messagingSenderId: "", appId: ""
+        };
+        const app = initializeApp(firebaseConfig);
+        const auth = getAuth(app);
+        const db = getFirestore(app);
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'vintage-manager-default';
+
+        // --- アプリケーションの状態 ---
+        let state = {
+            user: null,
+            authLoading: true,
+            secretWord: '',
+            isLoginMode: false,
+            authError: '',
+            items: [],
+            purchasingBudget: 40000,
+            newItem: { name: '', purchasePrice: '', purchaseShipping: '', listingPrice: '' },
+            randomSeed: Math.random()
+        };
+
+        let unsubItems = null;
+        let unsubBudget = null;
+
+        // --- 自動カテゴリ分類 ---
+        function categorizeItem(name) {
+            const lowerName = name.toLowerCase();
+            if (lowerName.includes('tシャツ') || lowerName.includes('ロンt')) return 'Tシャツ';
+            if (lowerName.includes('シャツ') || lowerName.includes('ブラウス')) return 'シャツ';
+            if (lowerName.includes('ジャケット') || lowerName.includes('コート') || lowerName.includes('アウター')) return 'アウター';
+            if (lowerName.includes('パンツ') || lowerName.includes('スラックス') || lowerName.includes('ショーツ')) return 'パンツ';
+            if (lowerName.includes('デニム') || lowerName.includes('ジーンズ')) return 'デニム';
+            if (lowerName.includes('ニット') || lowerName.includes('セーター') || lowerName.includes('カーディガン')) return 'ニット';
+            if (lowerName.includes('スウェット') || lowerName.includes('パーカー') || lowerName.includes('フーディ')) return 'スウェット';
+            if (lowerName.includes('スカート') || lowerName.includes('ワンピース')) return 'スカート/ワンピ';
+            if (lowerName.includes('靴') || lowerName.includes('スニーカー') || lowerName.includes('ブーツ')) return 'シューズ';
+            if (lowerName.includes('バッグ') || lowerName.includes('帽子') || lowerName.includes('キャップ')) return '小物';
+            return 'その他';
+        }
+
+        // --- 初期認証 ---
+        async function initAuth() {
+            try {
+                if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+                    await signInWithCustomToken(auth, __initial_auth_token);
+                } else {
+                    await signInAnonymously(auth);
+                }
+            } catch (err) {
+                console.error("Auth Error:", err);
+            }
+
+            onAuthStateChanged(auth, (u) => {
+                if (u && u.email && u.email.endsWith('@vintage.local')) {
+                    state.user = u;
+                    setupListeners(u.uid);
+                } else {
+                    state.user = null;
+                    cleanupListeners();
+                }
+                state.authLoading = false;
+                render();
+            });
+        }
+
+        function setupListeners(uid) {
+            cleanupListeners();
+            const itemsRef = collection(db, 'artifacts', appId, 'users', uid, 'items');
+            unsubItems = onSnapshot(itemsRef, (snapshot) => {
+                const fetched = [];
+                snapshot.forEach(docSnap => fetched.push({ id: docSnap.id, ...docSnap.data() }));
+                state.items = fetched.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+                render();
+            }, err => console.error(err));
+
+            const budgetRef = doc(db, 'artifacts', appId, 'users', uid, 'settings', 'budget');
+            unsubBudget = onSnapshot(budgetRef, (docSnap) => {
+                if (docSnap.exists() && docSnap.data().amount) {
+                    state.purchasingBudget = docSnap.data().amount;
+                    render();
+                }
+            }, err => console.error(err));
+        }
+
+        function cleanupListeners() {
+            if (unsubItems) unsubItems();
+            if (unsubBudget) unsubBudget();
+        }
+
+        // --- グローバル関数 (UIからの操作用) ---
+        window.handleAuthSubmit = async function(e) {
+            e.preventDefault();
+            const word = state.secretWord.trim();
+            if (!/^\d{4}$/.test(word)) {
+                state.authError = 'パスワードは4桁の数字で入力してください。';
+                render();
+                return;
+            }
+            state.authError = '';
+            const dummyEmail = `room_${word}@vintage.local`;
+            const dummyPassword = `pass_${word}_secure_123!`;
+
+            try {
+                if (state.isLoginMode) {
+                    await signInWithEmailAndPassword(auth, dummyEmail, dummyPassword);
+                } else {
+                    await createUserWithEmailAndPassword(auth, dummyEmail, dummyPassword);
+                }
+            } catch (err) {
+                if (state.isLoginMode) {
+                    state.authError = 'このパスワードは登録されていません。初回設定から進めてください。';
+                } else {
+                    state.authError = 'この4桁は既に他の人が使っています。別の番号にしてください。';
+                }
+                render();
+            }
+        };
+
+        window.handleLogout = async function() {
+            await signOut(auth);
+            await signInAnonymously(auth);
+            state.secretWord = '';
+            render();
+        };
+
+        window.toggleAuthMode = function() {
+            state.isLoginMode = !state.isLoginMode;
+            state.authError = '';
+            state.secretWord = '';
+            render();
+        };
+
+        window.updateSecretInput = function(val) {
+            state.secretWord = val.replace(/[^0-9]/g, '');
+        };
+
+        window.handleAddItem = async function(e) {
+            e.preventDefault();
+            if (!state.user || !state.newItem.name || !state.newItem.purchasePrice || !state.newItem.listingPrice) return;
+            
+            const itemsRef = collection(db, 'artifacts', appId, 'users', state.user.uid, 'items');
+            await addDoc(itemsRef, {
+                name: state.newItem.name,
+                purchasePrice: Number(state.newItem.purchasePrice),
+                purchaseShipping: Number(state.newItem.purchaseShipping) || 0,
+                listingPrice: Number(state.newItem.listingPrice),
+                isSold: false,
+                salesShipping: 0,
+                createdAt: Date.now()
+            });
+            state.newItem = { name: '', purchasePrice: '', purchaseShipping: '', listingPrice: '' };
+        };
+
+        window.toggleSoldStatus = async function(id, currentStatus, currentSalesShipping) {
+            if (!state.user) return;
+            state.randomSeed = Math.random();
+            const itemRef = doc(db, 'artifacts', appId, 'users', state.user.uid, 'items', id);
+            await updateDoc(itemRef, {
+                isSold: !currentStatus,
+                salesShipping: !currentStatus ? currentSalesShipping || 750 : 0
+            });
+        };
+
+        window.updateShippingBlur = async function(id, val) {
+            if (!state.user) return;
+            const itemRef = doc(db, 'artifacts', appId, 'users', state.user.uid, 'items', id);
+            await updateDoc(itemRef, { salesShipping: Number(val) });
+        };
+
+        window.updateBudgetBlur = async function(val) {
+            if (!state.user) return;
+            state.purchasingBudget = Number(val);
+            const budgetRef = doc(db, 'artifacts', appId, 'users', state.user.uid, 'settings', 'budget');
+            await setDoc(budgetRef, { amount: Number(val) }, { merge: true });
+        };
+
+        window.deleteItem = async function(id) {
+            if (!state.user) return;
+            const itemRef = doc(db, 'artifacts', appId, 'users', state.user.uid, 'items', id);
+            await deleteDoc(itemRef);
+        };
+
+        window.updateNewItemField = function(field, val) {
+            state.newItem[field] = val;
+        };
+
+        // --- メイン描画関数 ---
+        function render() {
+            const appEl = document.getElementById('app');
+            if (!appEl) return;
+
+            if (state.authLoading) {
+                appEl.innerHTML = `
+                    <div class="min-h-screen flex items-center justify-center">
+                        <div class="animate-pulse text-[#8C7A6B] flex flex-col items-center gap-3">
+                            <p>読み込み中...</p>
+                        </div>
+                    </div>
+                `;
+                return;
+            }
+
+            // 認証前画面
+            if (!state.user) {
+                appEl.innerHTML = `
+                    <div class="min-h-screen flex items-center justify-center p-4">
+                        <div class="bg-white/40 backdrop-blur-xl border border-white/60 p-8 rounded-3xl shadow-[0_8px_32px_0_rgba(107,96,84,0.1)] z-10 w-full max-w-md fade-in">
+                            <div class="text-center mb-8">
+                                <h1 class="text-2xl font-bold text-[#2C2621]">Vintage Forest</h1>
+                                <p class="text-[#6B6054] text-sm mt-2">${state.isLoginMode ? 'ログインしてデータを同期' : '初回設定（あなた専用の部屋を作成）'}</p>
+                            </div>
+                            <form onsubmit="handleAuthSubmit(event)" class="space-y-6">
+                                ${state.authError ? `<div class="bg-[#A85C5C]/10 border border-[#A85C5C]/30 text-[#A85C5C] text-xs p-3 rounded-xl text-center">${state.authError}</div>` : ''}
+                                <div>
+                                    <label class="block text-sm font-medium text-[#6B6054] mb-2 text-center">${state.isLoginMode ? '設定した4桁のパスワード' : '新しい4桁のパスワードを決める'}</label>
+                                    <input type="text" inputmode="numeric" maxlength="4" required value="${state.secretWord}" oninput="updateSecretInput(this.value)" class="w-full bg-white/60 border border-white/80 rounded-xl px-4 py-4 text-center text-3xl font-bold tracking-[0.5em] focus:outline-none focus:ring-2 focus:ring-[#7D9179]/50 transition-all text-[#2C2621]" placeholder="0000" />
+                                </div>
+                                <button type="submit" class="w-full bg-[#5C715E] hover:bg-[#4A5B4B] text-white rounded-xl py-3.5 text-base font-medium transition-colors shadow-md shadow-[#5C715E]/20 cursor-pointer">
+                                    ${state.isLoginMode ? 'データを開く' : '設定してはじめる'}
+                                </button>
+                            </form>
+                            <div class="mt-6 text-center">
+                                <button onclick="toggleAuthMode()" class="text-xs text-[#8C7A6B] hover:text-[#5C715E] underline transition-colors cursor-pointer">
+                                    ${state.isLoginMode ? '初めての方はこちら（初回設定）' : 'すでに設定済みの方（ログイン）'}
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                `;
+                return;
+            }
+
+            // 計算ロジック
+            let totalSales = 0, mercariFeeTotal = 0, netSales = 0;
+            state.items.forEach(item => {
+                if (item.isSold) {
+                    const price = Number(item.listingPrice);
+                    const fee = Math.floor(price * 0.1);
+                    const shipping = Number(item.salesShipping) || 0;
+                    totalSales += price;
+                    mercariFeeTotal += fee;
+                    netSales += (price - fee - shipping);
+                }
+            });
+
+            const repayment = 20000;
+            const availableAfterFixed = netSales - repayment - state.purchasingBudget;
+            const reserveRatio = 0.1 + (state.randomSeed * 0.2);
+            const reserveFund = availableAfterFixed > 0 ? Math.floor(availableAfterFixed * reserveRatio) : 0;
+            const freeFund = availableAfterFixed > 0 ? availableAfterFixed - reserveFund : availableAfterFixed;
+
+            // カテゴリ別集計
+            const chartCounts = {};
+            state.items.forEach(item => {
+                const cat = categorizeItem(item.name);
+                if (!chartCounts[cat]) chartCounts[cat] = { category: cat, active: 0, sold: 0 };
+                if (item.isSold) chartCounts[cat].sold += 1;
+                else chartCounts[cat].active += 1;
+            });
+            const chartData = Object.values(chartCounts).sort((a, b) => (b.active + b.sold) - (a.active + a.sold));
+
+            const activeItems = state.items.filter(i => !i.isSold);
+            const soldItems = state.items.filter(i => i.isSold);
+            const displaySecretWord = state.user.email ? state.user.email.replace('room_', '').replace('@vintage.local', '') : '';
+
+            // メインダッシュボード描画
+            appEl.innerHTML = `
+                <div class="fade-in">
+                    <header class="mb-10 flex flex-col sm:flex-row items-center justify-between gap-4">
+                        <div class="text-center sm:text-left">
+                            <h1 class="text-3xl sm:text-4xl font-bold tracking-tight text-[#2C2621] flex items-center justify-center sm:justify-start gap-3">
+                                Vintage Forest
+                            </h1>
+                            <p class="mt-1 text-xs text-[#6B6054] bg-[#E1D7C6]/50 inline-block px-3 py-1 rounded-full font-medium">
+                                設定した4桁: <span class="font-bold text-[#3D352B] tracking-wider">${displaySecretWord}</span>
+                            </p>
+                        </div>
+                        <button onclick="handleLogout()" class="text-xs text-[#8C7A6B] hover:text-[#A85C5C] bg-white/40 px-4 py-2 rounded-full border border-white/60 transition-colors cursor-pointer">
+                            終了する
+                        </button>
+                    </header>
+
+                    <!-- ダッシュボードパネル -->
+                    <div class="bg-white/40 backdrop-blur-xl border border-white/60 rounded-3xl p-6 sm:p-8 mb-12 shadow-[0_8px_32px_0_rgba(107,96,84,0.1)]">
+                        <h2 class="text-xl font-semibold mb-6">売上と資金分配シミュレーション</h2>
+                        <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 mb-8">
+                            <div class="bg-white/50 rounded-2xl p-4 border border-white/50">
+                                <p class="text-sm text-[#6B6054] mb-1">売上金合計 (手数料・送料引後)</p>
+                                <p class="text-2xl font-bold text-[#2C2621]">¥${netSales.toLocaleString()}</p>
+                                <p class="text-xs text-[#8C7A6B] mt-2">※メルカリ手数料: ¥${mercariFeeTotal.toLocaleString()}</p>
+                            </div>
+                            <div class="bg-white/50 rounded-2xl p-4 border border-white/50 relative overflow-hidden">
+                                <div class="absolute top-0 left-0 w-1 h-full bg-[#A85C5C]"></div>
+                                <p class="text-sm text-[#6B6054] mb-1">月々返済額 (固定)</p>
+                                <p class="text-2xl font-bold text-[#A85C5C]">-¥${repayment.toLocaleString()}</p>
+                            </div>
+                            <div class="bg-white/50 rounded-2xl p-4 border border-white/50 relative overflow-hidden">
+                                <div class="absolute top-0 left-0 w-1 h-full bg-[#D4A373]"></div>
+                                <p class="text-sm text-[#6B6054] mb-1">仕入れ費用 (調整可)</p>
+                                <p class="text-2xl font-bold text-[#D4A373]">-¥${state.purchasingBudget.toLocaleString()}</p>
+                                <input type="range" min="30000" max="50000" step="1000" value="${state.purchasingBudget}" onchange="updateBudgetBlur(this.value)" class="w-full mt-3 accent-[#D4A373] h-1 bg-[#E1D7C6] rounded-lg appearance-none cursor-pointer" />
+                            </div>
+                            <div class="bg-white/50 rounded-2xl p-4 border border-white/50 relative overflow-hidden">
+                                <div class="absolute top-0 left-0 w-1 h-full bg-[#5C715E]"></div>
+                                <p class="text-sm text-[#6B6054] mb-1">経営資金 (自動ランダム)</p>
+                                <p class="text-2xl font-bold text-[#5C715E]">-¥${reserveFund.toLocaleString()}</p>
+                            </div>
+                        </div>
+                        <div class="p-6 rounded-2xl border ${freeFund > 0 ? 'bg-gradient-to-r from-[#5C715E]/10 to-[#7D9179]/10 border-[#7D9179]/30' : 'bg-white/40 border-white/50'}">
+                            <h3 class="text-lg text-[#6B6054] text-center mb-2">手元に残る自由資金</h3>
+                            <p class="text-4xl sm:text-5xl font-bold text-center tracking-tight ${freeFund > 0 ? 'text-[#3E4C40]' : 'text-[#A85C5C]'}">
+                                ${freeFund > 0 ? '+' : ''}¥${freeFund.toLocaleString()}
+                            </p>
+                        </div>
+                    </div>
+
+                    <div class="grid grid-cols-1 lg:grid-cols-3 gap-8">
+                        <!-- 左カラム: 登録フォーム & グラフ -->
+                        <div class="lg:col-span-1 space-y-8">
+                            <div class="bg-white/40 backdrop-blur-xl border border-white/60 rounded-3xl p-6 shadow-sm">
+                                <h2 class="text-lg font-semibold mb-5">新しい商品を登録</h2>
+                                <form onsubmit="handleAddItem(event)" class="space-y-4">
+                                    <div>
+                                        <label class="block text-xs font-medium text-[#6B6054] mb-1">商品名 (特徴を含める)</label>
+                                        <input type="text" required placeholder="例: 90s NIKE スウェット" value="${state.newItem.name}" oninput="updateNewItemField('name', this.value)" class="w-full bg-white/60 border border-white/80 rounded-xl px-4 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-[#7D9179]/50 text-[#2C2621]" />
+                                    </div>
+                                    <div class="grid grid-cols-2 gap-3">
+                                        <div>
+                                            <label class="block text-xs font-medium text-[#6B6054] mb-1">仕入れ値 (¥)</label>
+                                            <input type="number" required placeholder="1500" value="${state.newItem.purchasePrice}" oninput="updateNewItemField('purchasePrice', this.value)" class="w-full bg-white/60 border border-white/80 rounded-xl px-4 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-[#7D9179]/50 text-[#2C2621]" />
+                                        </div>
+                                        <div>
+                                            <label class="block text-xs font-medium text-[#6B6054] mb-1">仕入れ送料 (¥)</label>
+                                            <input type="number" placeholder="210" value="${state.newItem.purchaseShipping}" oninput="updateNewItemField('purchaseShipping', this.value)" class="w-full bg-white/60 border border-white/80 rounded-xl px-4 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-[#7D9179]/50 text-[#2C2621]" />
+                                        </div>
+                                    </div>
+                                    <div>
+                                        <label class="block text-xs font-medium text-[#6B6054] mb-1">出品予定価格 (¥)</label>
+                                        <input type="number" required placeholder="5500" value="${state.newItem.listingPrice}" oninput="updateNewItemField('listingPrice', this.value)" class="w-full bg-white/60 border border-white/80 rounded-xl px-4 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-[#7D9179]/50 text-[#2C2621]" />
+                                    </div>
+                                    <button type="submit" class="w-full bg-[#5C715E] hover:bg-[#4A5B4B] text-white rounded-xl py-3 text-sm font-medium transition-colors shadow-md shadow-[#5C715E]/20 cursor-pointer">
+                                        登録する
+                                    </button>
+                                </form>
+                            </div>
+
+                            <div class="bg-white/40 backdrop-blur-xl border border-white/60 rounded-3xl p-6 shadow-sm">
+                                <h2 class="text-lg font-semibold mb-5 text-[#2C2621]">カテゴリ別 市場動向</h2>
+                                <div class="space-y-4">
+                                    ${chartData.length === 0 ? `<p class="text-sm text-[#8C7A6B] text-center py-4">データがありません</p>` : chartData.map(data => {
+                                        const total = data.active + data.sold;
+                                        const soldP = (data.sold / total) * 100;
+                                        const activeP = (data.active / total) * 100;
+                                        return `
+                                            <div>
+                                                <div class="flex justify-between text-xs mb-1">
+                                                    <span class="font-medium text-[#4a3f35]">${data.category}</span>
+                                                    <span class="text-[#8C7A6B]">計 ${total}着 (売却 ${data.sold})</span>
+                                                </div>
+                                                <div class="h-3 w-full bg-[#E1D7C6] rounded-full overflow-hidden flex">
+                                                    <div class="h-full bg-[#5C715E]" style="width: ${soldP}%"></div>
+                                                    <div class="h-full bg-[#D4A373]" style="width: ${activeP}%"></div>
+                                                </div>
+                                            </div>
+                                        `;
+                                    }).join('')}
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- 右カラム: リスト一覧 -->
+                        <div class="lg:col-span-2 space-y-8">
+                            <!-- 出品中 -->
+                            <div>
+                                <h2 class="text-xl font-bold mb-4 text-[#2C2621]">出品中（売れ残り一覧） <span class="text-sm font-normal text-[#8C7A6B] ml-2">${activeItems.length}件</span></h2>
+                                ${activeItems.length === 0 ? `<div class="bg-white/40 border border-white/60 rounded-2xl p-8 text-center text-[#8C7A6B]">現在出品中のアイテムはありません。</div>` : `
+                                    <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                                        ${activeItems.map(item => `
+                                            <div class="bg-white/60 backdrop-blur-md border border-white/80 rounded-2xl p-4 shadow-sm">
+                                                <div class="flex justify-between items-start mb-2">
+                                                    <h3 class="font-medium text-[#2C2621] text-sm leading-tight line-clamp-2 pr-2">${item.name}</h3>
+                                                    <div class="flex items-center shrink-0">
+                                                        <span class="text-[10px] bg-[#E1D7C6] text-[#6B6054] px-2 py-1 rounded-full">${categorizeItem(item.name)}</span>
+                                                        <button onclick="deleteItem('${item.id}')" class="ml-2 text-[#A85C5C]/60 hover:text-[#A85C5C] p-1 cursor-pointer">🗑️</button>
+                                                    </div>
+                                                </div>
+                                                <div class="text-xs text-[#8C7A6B] mb-4 space-y-1">
+                                                    <p>仕入れ: ¥${item.purchasePrice} (+送料¥${item.purchaseShipping})</p>
+                                                    <p class="font-semibold text-[#D4A373]">出品価格: ¥${item.listingPrice}</p>
+                                                </div>
+                                                <button onclick="toggleSoldStatus('${item.id}', ${item.isSold}, ${item.salesShipping})" class="w-full border-2 border-[#5C715E] text-[#5C715E] hover:bg-[#5C715E] hover:text-white rounded-xl py-2 text-sm font-medium transition-colors cursor-pointer">
+                                                    売れた！チェックをつける
+                                                </button>
+                                            </div>
+                                        `).join('')}
+                                    </div>
+                                `}
+                            </div>
+
+                            <!-- 売却済み -->
+                            <div>
+                                <h2 class="text-xl font-bold mb-4 text-[#2C2621]">売却済みアイテム <span class="text-sm font-normal text-[#8C7A6B] ml-2">${soldItems.length}件</span></h2>
+                                ${soldItems.length === 0 ? `<div class="bg-white/40 border border-white/60 rounded-2xl p-8 text-center text-[#8C7A6B]">まだ売れたアイテムはありません。</div>` : `
+                                    <div class="space-y-3">
+                                        ${soldItems.map(item => {
+                                            const price = Number(item.listingPrice);
+                                            const fee = Math.floor(price * 0.1);
+                                            const shipping = Number(item.salesShipping) || 0;
+                                            const salesAmount = price - fee - shipping;
+                                            const purchaseTotal = Number(item.purchasePrice) + (Number(item.purchaseShipping) || 0);
+                                            const profit = salesAmount - purchaseTotal;
+                                            return `
+                                                <div class="bg-white/40 backdrop-blur-sm border border-[#5C715E]/20 rounded-2xl p-4 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4">
+                                                    <div class="flex-1 w-full">
+                                                        <div class="flex justify-between items-start">
+                                                            <h3 class="font-medium text-[#2C2621] text-sm line-through opacity-70 pr-2">${item.name}</h3>
+                                                            <div class="text-right shrink-0">
+                                                                <span class="text-[10px] text-[#8C7A6B] block">売上金(入金額)</span>
+                                                                <span class="font-bold text-[#5C715E] text-base">¥${salesAmount.toLocaleString()}</span>
+                                                            </div>
+                                                        </div>
+                                                        <div class="flex flex-wrap items-center gap-x-3 gap-y-1 mt-2 text-[10px] text-[#6B6054]">
+                                                            <span>販売額: ¥${price.toLocaleString()}</span>
+                                                            <span class="text-[#A85C5C]">-手数料: ¥${fee.toLocaleString()}</span>
+                                                            <span class="text-[#A85C5C]">-仕入れ等: ¥${purchaseTotal.toLocaleString()}</span>
+                                                            <span class="font-medium ${profit > 0 ? 'text-[#3E4C40]' : 'text-[#A85C5C]'}">利益: ${profit > 0 ? '+' : ''}¥${profit.toLocaleString()}</span>
+                                                        </div>
+                                                    </div>
+                                                    <div class="flex items-center gap-3 w-full sm:w-auto mt-2 sm:mt-0 justify-between sm:justify-end">
+                                                        <div class="flex-1 sm:flex-none flex items-center gap-2 bg-white/60 border border-white/80 rounded-xl px-3 py-1.5">
+                                                            <label class="text-[10px] text-[#8C7A6B]">売却送料</label>
+                                                            <input type="number" value="${item.salesShipping}" onblur="updateShippingBlur('${item.id}', this.value)" class="w-16 bg-transparent text-sm focus:outline-none font-medium text-[#2C2621]" />
+                                                            <span class="text-xs text-[#8C7A6B]">円</span>
+                                                        </div>
+                                                        <button onclick="toggleSoldStatus('${item.id}', ${item.isSold}, ${item.salesShipping})" class="text-xs text-[#8C7A6B] hover:text-[#2C2621] underline cursor-pointer">元に戻す</button>
+                                                        <button onclick="deleteItem('${item.id}')" class="text-[#A85C5C]/60 hover:text-[#A85C5C] p-1 cursor-pointer">🗑️</button>
+                                                    </div>
+                                                </div>
+                                            `;
+                                        }).join('')}
+                                    </div>
+                                `}
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            `;
+        }
+
+        // アプリ起動
+        initAuth();
+    </script>
+</body>
+</html>
+
